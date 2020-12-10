@@ -30,6 +30,10 @@ var LifxLight = require('node-lifx').Light;
 var LifxPacket = require('node-lifx').packet;
 var LifxConstants = require('node-lifx').constants;
 
+var http = require('http');
+var qs = require('querystring');
+var concat = require('concat-stream');
+
 var Client = new LifxClient();
 var Characteristic, ColorTemperature, Kelvin, PlatformAccessory, Service, UUIDGen;
 
@@ -98,7 +102,12 @@ function LifxLanPlatform(log, config, api) {
         delete this.config.ignoredDevices;
     }
 
+    if (this.config.preventOnlineColorUpdateDevicesList && this.config.preventOnlineColorUpdateDevicesList.constructor !== Array) {
+        delete this.config.preventOnlineColorUpdateDevicesList;
+    }
+
     this.ignoredDevices = this.config.ignoredDevices || [];
+    this.preventOnlineColorUpdateDevicesList = this.config.preventOnlineColorUpdateDevicesList || [];
 
     this.api = api;
     this.accessories = {};
@@ -111,6 +120,7 @@ function LifxLanPlatform(log, config, api) {
         if (object !== undefined) {
             if (object instanceof LifxAccessory) {
                 this.log("Offline: %s [%s]", object.accessory.context.name, bulb.id);
+                object.updateReachability(bulb, false);
             }
         }
     }.bind(this));
@@ -132,7 +142,17 @@ function LifxLanPlatform(log, config, api) {
         else {
             if (accessory instanceof LifxAccessory) {
                 this.log("Online: %s [%s]", accessory.accessory.context.name, bulb.id);
-                accessory.updateReachability(bulb);
+                accessory.updateReachability(bulb, true);
+                // TODO: check if no current parameters of this light, and read its current state to use it as a reference (effectivly after Pi restart for example)...
+                if (this.preventOnlineColorUpdateDevicesList.indexOf(bulb.id) === -1) {
+                    this.log("accessory.color.brightness: " +  accessory.accessory.context.name + ': ' + accessory.color.brightness);
+	                accessory.bulb.color(accessory.color.hue, accessory.color.saturation, accessory.color.brightness, accessory.color.kelvin, fadeDuration, function (err) {
+	                    
+	                });
+                }
+                accessory.bulb[accessory.power ? "on" : "off"](fadeDuration, function(err) {
+                    
+                }.bind(this));
             }
         }
     }.bind(this));
@@ -159,11 +179,180 @@ function LifxLanPlatform(log, config, api) {
                     }
                 }
 
-                this.log("Online: %s [%s]", accessory.context.name, bulb.id);
+                this.log("New Light Online: %s [%s]", accessory.context.name, bulb.id);
                 this.accessories[uuid] = new LifxAccessory(this.log, accessory, bulb, state);
             }.bind(this));
         }
     }.bind(this));
+
+
+    Client.on('error', function(error) {
+        console.log('Restarting lifx-node instance duo to error.');
+        Client.destroy();
+        Client.init({
+            debug:                  this.config.debug || false,
+            broadcast:              this.config.broadcast || '255.255.255.255',
+            lightOfflineTolerance:  this.config.lightOfflineTolerance || 2,
+            messageHandlerTimeout:  this.config.messageHandlerTimeout || 2500,
+            resendMaxTimes:         this.config.resendMaxTimes || 3,
+            resendPacketDelay:      this.config.resendPacketDelay || 500,
+            address:                this.config.address || '0.0.0.0'
+        });
+    }.bind(this));
+
+
+    // Create http-server to trigger doorbell from outside: 
+    // curl -X POST -d 'ding=dong&dong=ding' http://HOMEBRIDGEIP:PORT
+    var webserverPort = 5018;
+    var server = http.createServer(function (req, res) {
+        req.pipe(concat(function (body) {
+            // console.log(body.toString());
+            var params = JSON.parse(body.toString());//qs.parse(body.toString()); // needed only if sent as body params...
+            if (params.bid && !params.bids) {
+                params.bids = [params.bid];
+            }
+            if (params.bids) {
+                res.end(JSON.stringify(params) + '\n');
+                for (var i = params.bids.length - 1; i >= 0; i--) {
+                    var bid = params.bids[i];
+                    var uuid = UUIDGen.generate(bid);
+                    var bulb = this.accessories[uuid];
+                    if (bulb) {
+                        if (params.action==='toggle') {
+                            console.log("LIFX %s toggle!", bid);
+                            if (bulb.accessory) {
+                                var service = bulb.accessory.getService(Service.Lightbulb);
+                                var characteristic = service.getCharacteristic(Characteristic.On);
+                                var newPowerState = !characteristic.value;
+                                characteristic.setValue(newPowerState > 0);
+                                if (newPowerState) {
+                                    characteristic = service.getCharacteristic(Characteristic.Brightness);
+                                    if (characteristic.value !== 100) {
+                                        characteristic.setValue(100);
+                                    }
+                                }
+                                if (params.bids.length > 1) {
+                                	if (newPowerState) {
+                                		params.action = 'turn_on';
+                                	} else {
+                                		params.action = 'turn_off';
+                                	}
+                                }
+                            } else {
+                                bulb.power = !bulb.power;
+                            }
+                        } else if (params.action==='turn_on') {
+                            console.log("LIFX %s turn_on!", bid);
+                            if (bulb.accessory) {
+                                var service = bulb.accessory.getService(Service.Lightbulb);
+                                var origPowerState = service.getCharacteristic(Characteristic.On).value;
+                                if (!origPowerState) {
+	                                service.getCharacteristic(Characteristic.On).setValue(true);
+                                }
+                                var characteristic = service.getCharacteristic(Characteristic.Brightness);
+                                if (((params.reset_ct && origPowerState) || !params.reset_ct) && characteristic.value !== 100) {
+                                    characteristic.setValue(100);
+                                }
+                            } else {
+                                bulb.power = 1;
+                            }
+                        } else if (params.action==='turn_off') {
+                            console.log("LIFX %s turn_off!", bid);
+                            if (bulb.accessory) {
+                                var service = bulb.accessory.getService(Service.Lightbulb);
+                                if (service.getCharacteristic(Characteristic.On).value) {
+	                                service.getCharacteristic(Characteristic.On).setValue(false);
+                                }
+                            } else {
+                                bulb.power = 0;
+                            }
+                        } else if (params.action==='brighter') {
+                            console.log("LIFX %s brighter!", bid);
+                            if (bulb.accessory) {
+                                var service = bulb.accessory.getService(Service.Lightbulb);
+                                if (!service.getCharacteristic(Characteristic.On).value) {
+	                                service.getCharacteristic(Characteristic.Brightness).setValue(2);
+	                                service.getCharacteristic(Characteristic.On).setValue(true);
+                                } else {
+	                                var characteristic = service.getCharacteristic(Characteristic.Brightness);
+                                    // var newBrightnessState = Math.min(100, characteristic.value + 5);
+	                                var newBrightnessState = Math.min(100, bulb.color.brightness + 5);
+	                                characteristic.setValue(newBrightnessState);
+                                }
+                            } else {
+                                var newBrightnessState = Math.min(100, bulb.brightness + 5);
+                                bulb.brightness = newBrightnessState;
+                            }
+                        } else if (params.action==='darker') {
+                            console.log("LIFX %s darker!", bid);
+                            if (bulb.accessory) {
+                                var service = bulb.accessory.getService(Service.Lightbulb);
+                                var characteristic = service.getCharacteristic(Characteristic.Brightness);
+                                // var newBrightnessState = Math.max(2, characteristic.value - 5);
+                                var newBrightnessState = Math.max(2, bulb.color.brightness - 5);
+                                characteristic.setValue(newBrightnessState);
+                            } else {
+                                var newBrightnessState = Math.max(2, bulb.brightness - 5);
+                                bulb.brightness = newBrightnessState;
+                            }
+                        } else if (params.action==='colder') {
+                            console.log("LIFX %s colder!", bid);
+                            if (bulb.accessory) {
+                                var service = bulb.accessory.getService(Service.Lightbulb);
+                                var characteristic = service.getCharacteristic(ColorTemperature);
+                                var newColorTemperatureState = Math.max(112, characteristic.value - 32);
+                                characteristic.setValue(newColorTemperatureState);
+                            } else {
+                                // var newColorTemperatureState = Math.min(112, bulb.brightness + 32);
+                                // bulb.brightness = newColorTemperatureState;
+                            }
+                        } else if (params.action==='warmer') {
+                            console.log("LIFX %s warmer!", bid);
+                            if (bulb.accessory) {
+                                var service = bulb.accessory.getService(Service.Lightbulb);
+                                var characteristic = service.getCharacteristic(ColorTemperature);
+                                var newColorTemperatureState = Math.min(400, characteristic.value + 32);
+                                characteristic.setValue(newColorTemperatureState);
+                            } else {
+                                // var newColorTemperatureState = Math.max(400, bulb.brightness - 5);
+                                // bulb.brightness = newColorTemperatureState;
+                            }
+                        } else if (params.action==='reset') {
+                            console.log("LIFX %s reset!", bid);
+                            if (bulb.accessory) {
+                                var service = bulb.accessory.getService(Service.Lightbulb);
+                                service.getCharacteristic(Characteristic.On).setValue(true);
+                                service.getCharacteristic(Characteristic.Brightness).setValue(100);
+                                service.getCharacteristic(ColorTemperature).setValue(params.reset_ct ? params.reset_ct : 363);
+                            } else {
+                                // bulb.power = true;
+                                // bulb.brightness = 100;
+                                // bulb.color.hue = 0;
+                                // bulb.color.saturation = 0;
+                                // bulb.color.kelvin = 2750;
+                            }
+                        } else {
+                            console.log('Unknown request to LIFX %s.\nContent: %s', bid, JSON.stringify(params));
+                        }
+                    } else {
+                        console.log('Unknown request to LIFX %s, Bulb not found.\nContent: %s', bid, JSON.stringify(params));
+                    }
+                }
+            } else {
+                console.log('Unknown request to LIFX, Missing params.\nContent: %s', JSON.stringify(params));
+            }
+        }.bind(this)));
+    }.bind(this));
+
+    //var server = http.createServer(self.handleRequest.bind(this));
+    server.listen(webserverPort, function () {
+        console.log("LIFX is listening on port %s", webserverPort);
+    }.bind(this));
+
+    server.on('error', function (err) {
+        console.log("LIFX Port %s Server %s ", webserverPort, err);
+    }.bind(this));
+                
 
     this.api.on('didFinishLaunching', function() {
         Client.init({
@@ -178,7 +367,7 @@ function LifxLanPlatform(log, config, api) {
     }.bind(this));
 }
 
-LifxLanPlatform.prototype.addAccessory = function(bulb, data) {
+LifxLanPlatform.prototype.addAccessory = function(bulb) {
     bulb.getState(function(err, state) {
             if (err) {
                 state = {
@@ -216,7 +405,7 @@ LifxLanPlatform.prototype.addAccessory = function(bulb, data) {
                     service.addCharacteristic(Characteristic.Saturation);
                 }
 
-                this.accessories[accessory.UUID] = new LifxAccessory(this.log, accessory, bulb, data);
+                this.accessories[accessory.UUID] = new LifxAccessory(this.log, accessory, bulb, state);
 
                 this.api.registerPlatformAccessories("homebridge-lifx-lan", "LifxLan", [accessory]);
             }.bind(this));
@@ -224,6 +413,7 @@ LifxLanPlatform.prototype.addAccessory = function(bulb, data) {
 }
 
 LifxLanPlatform.prototype.configureAccessory = function(accessory) {
+    accessory.updateReachability(false);
     this.accessories[accessory.UUID] = accessory;
 }
 
@@ -467,23 +657,45 @@ LifxLanPlatform.prototype.configurationRequestHandler = function(context, reques
                     "interface": "list",
                     "title": "Select Option",
                     "allowMultipleSelection": false,
-                    "items": ["Ignored Devices"]
+                    "items": ["Ignored Devices", "Color Update On Online Prevention"]
                 }
+
+	            context.onScreen = "IgnoreListType";
             }
 
             callback(respDict);
             break;
-        case "Configuration":
-            respDict = {
-                "type": "Interface",
-                "interface": "list",
-                "title": "Modify Ignored Devices",
-                "allowMultipleSelection": false,
-                "items": this.ignoredDevices.length > 0 ? ["Add Accessory", "Remove Accessory"] : ["Add Accessory"]
+        case "IgnoreListType":
+            switch(request.response.selections[0]) {
+                case 0:
+                    context.onScreen = "Configuration";
+                    break;
+                case 1:
+                    context.onScreen = "ColorUpdateIgnoreListConfiguration";
+                    break;
             }
 
-            context.onScreen = "IgnoreList";
+	        if (context.onScreen == "Configuration") {
+	            respDict = {
+	                "type": "Interface",
+	                "interface": "list",
+	                "title": "Modify Ignored Devices",
+	                "allowMultipleSelection": false,
+	                "items": this.ignoredDevices.length > 0 ? ["Add Accessory", "Remove Accessory"] : ["Add Accessory"]
+	            }
 
+	            context.onScreen = "IgnoreList";
+	        } else {
+	            respDict = {
+	                "type": "Interface",
+	                "interface": "list",
+	                "title": "Modify Color Ignored Devices",
+	                "allowMultipleSelection": false,
+	                "items": this.preventOnlineColorUpdateDevicesList.length > 0 ? ["Add Accessory", "Remove Accessory"] : ["Add Accessory"]
+	            }
+
+	            context.onScreen = "ColorUpdateIgnoreList";
+	        }
             callback(respDict);
             break;
         case "IgnoreList":
@@ -558,6 +770,76 @@ LifxLanPlatform.prototype.configurationRequestHandler = function(context, reques
             context.onScreen = null;
             callback(respDict, "platform", true, this.config);
             break;
+        case "ColorUpdateIgnoreList":
+            context.onScreen = request && request.response && request.response.selections[0] == 1 ? "ColorUpdateIgnoreListRemove" : "ColorUpdateIgnoreListAdd";
+
+            if (context.onScreen == "ColorUpdateIgnoreListAdd") {
+                respDict = {
+                    "type": "Interface",
+                    "interface": "list",
+                    "title": "Select accessory to add to Color Update Ignored Devices",
+                    "allowMultipleSelection": true,
+                    "items": sortAccessories()
+                }
+            }
+            else {
+                context.selection = JSON.parse(JSON.stringify(this.preventOnlineColorUpdateDevicesList));
+
+                respDict = {
+                    "type": "Interface",
+                    "interface": "list",
+                    "title": "Select accessory to remove from Color Update Ignored Devices",
+                    "allowMultipleSelection": true,
+                    "items": context.selection
+                }
+            }
+
+            callback(respDict);
+            break;
+        case "ColorUpdateIgnoreListAdd":
+            if (request.response.selections) {
+                for (var i in request.response.selections.sort()) {
+                    var accessory = context.sortedAccessories[request.response.selections[i]];
+
+                    if (accessory.context && accessory.context.id && this.ignoredDevices.indexOf(accessory.context.id) == -1) {
+                        this.preventOnlineColorUpdateDevicesList.push(accessory.context.id);
+                    }
+                }
+
+                this.config.preventOnlineColorUpdateDevicesList = this.preventOnlineColorUpdateDevicesList;
+
+                respDict = {
+                    "type": "Interface",
+                    "interface": "instruction",
+                    "title": "Finished",
+                    "detail": "Color Update Ignore List update was successful."
+                }
+            }
+
+            context.onScreen = null;
+            callback(respDict, "platform", true, this.config);
+            break;
+
+        case "ColorUpdateIgnoreListRemove":
+            if (request.response.selections) {
+                for (var i in request.response.selections) {
+                    var id = context.selection[request.response.selections[i]];
+
+                    if (this.preventOnlineColorUpdateDevicesList.indexOf(id) != -1) {
+                        this.preventOnlineColorUpdateDevicesList.splice(this.preventOnlineColorUpdateDevicesList.indexOf(id), 1);
+                    }
+                }
+            }
+
+            this.config.preventOnlineColorUpdateDevicesList = this.preventOnlineColorUpdateDevicesList;
+
+            if (this.config.preventOnlineColorUpdateDevicesList.length === 0) {
+                delete this.config.preventOnlineColorUpdateDevicesList;
+            }
+
+            context.onScreen = null;
+            callback(respDict, "platform", true, this.config);
+            break;
         default:
             if (request && (request.response || request.type === "Terminate")) {
                 context.onScreen = null;
@@ -594,6 +876,7 @@ function LifxAccessory(log, accessory, bulb, data) {
     this.color = data.color || {hue: 0, saturation: 0, brightness: 50, kelvin: 2500};
     this.log = log;
     this.callbackStack = [];
+    this.bulbIsOnline = accessory.reachable;
 
     if (!this.accessory instanceof PlatformAccessory) {
         this.log("ERROR \n", this);
@@ -629,13 +912,32 @@ function LifxAccessory(log, accessory, bulb, data) {
         service.addCharacteristic(ColorTemperature);
     }
 
+    // Update the characteristics to the ones in the bulb itself...
+    service.getCharacteristic(Characteristic.On).updateValue(this.power > 0);
+    
+    if (service.testCharacteristic(Characteristic.Brightness)) {
+        service.getCharacteristic(Characteristic.Brightness).updateValue(this.color.brightness);
+    }
+
+    if (service.testCharacteristic(ColorTemperature)) {
+        service.getCharacteristic(ColorTemperature).updateValue(this.miredConversion(this.color.kelvin));
+    }
+
+    if (service.testCharacteristic(Characteristic.Hue)) {
+        service.getCharacteristic(Characteristic.Hue).updateValue(this.color.hue);
+    }
+
+    if (service.testCharacteristic(Characteristic.Saturation)) {
+        service.getCharacteristic(Characteristic.Saturation).updateValue(this.color.saturation);
+    }
+
     this.accessory.on('identify', function(paired, callback) {
         this.log("%s - identify", this.accessory.context.name);
         this.setWaveform(null, callback);
     }.bind(this));
 
     this.addEventHandlers();
-    this.updateReachability(bulb);
+    this.updateReachability(bulb, true);
 }
 
 LifxAccessory.prototype.addEventHandler = function(service, characteristic) {
@@ -664,12 +966,14 @@ LifxAccessory.prototype.addEventHandler = function(service, characteristic) {
                 .getCharacteristic(Characteristic.Brightness)
                 .setValue(this.color.brightness)
                 .setProps({minValue: 1})
+                .on('get', this.getBrightness.bind(this))
                 .on('set', this.setBrightness.bind(this));
             break;
         case ColorTemperature:
             service
                 .getCharacteristic(ColorTemperature)
                 .setValue(this.miredConversion(this.color.kelvin))
+                .on('get', this.getKelvin.bind(this))
                 .on('set', this.setKelvin.bind(this));
             break;
         case Characteristic.CurrentAmbientLightLevel:
@@ -681,12 +985,14 @@ LifxAccessory.prototype.addEventHandler = function(service, characteristic) {
             service
                 .getCharacteristic(Characteristic.Hue)
                 .setValue(this.color.hue)
+                .on('get', this.getHue.bind(this))
                 .on('set', this.setHue.bind(this));
             break;
         case Characteristic.Saturation:
             service
                 .getCharacteristic(Characteristic.Saturation)
                 .setValue(this.color.saturation)
+                .on('get', this.getSaturation.bind(this))
                 .on('set', this.setSaturation.bind(this));
             break;
     }
@@ -750,41 +1056,69 @@ LifxAccessory.prototype.getPower = function(callback) {
     this.getState("power", callback);
 }
 
+LifxAccessory.prototype.getBrightness = function(callback) {
+    this.getState("brightness", callback);
+}
+
+LifxAccessory.prototype.getKelvin = function(callback) {
+    this.getState("kelvin", callback);
+}
+
+LifxAccessory.prototype.getHue = function(callback) {
+    this.getState("hue", callback);
+}
+
+LifxAccessory.prototype.getSaturation = function(callback) {
+    this.getState("saturation", callback);
+}
+
 LifxAccessory.prototype.getState = function(type, callback) {
-    if (this.lastCalled && (Date.now() - this.lastCalled) < 5000) {
+    // if (!this.accessory.reachable) {
+    //     callback('Bulb not reachable');
+    //     return;
+    // }
+    
+    if ((this.lastCalled && (Date.now() - this.lastCalled) < 5000) || !this.bulbIsOnline) {
         callback(null, this.get(type));
         return;
     }
 
     this.lastCalled = Date.now();
 
-    this.callbackStack.push(callback);
-
+    // this.callbackStack.push(callback);
+    var that = this;
     this.bulb.getState(function(err, data) {
         if (data) {
-            this.power = data.power;
-            this.color = data.color;
+            that.power = data.power;
+            that.color = data.color;
+            that.log('New state from bulb is: ' + JSON.stringify(data));
+            
+            that.accessory.updateReachability(true);
 
-            var service = this.accessory.getService(Service.Lightbulb);
+            // var service = that.accessory.getService(Service.Lightbulb);
+            
+            // service.getCharacteristic(Characteristic.On).updateValue(that.power > 0);
+            
+            // if (service.testCharacteristic(Characteristic.Brightness)) {
+            //     service.getCharacteristic(Characteristic.Brightness).updateValue(that.color.brightness);
+            // }
 
-            if (service.testCharacteristic(Characteristic.Brightness)) {
-                service.getCharacteristic(Characteristic.Brightness).updateValue(this.color.brightness);
-            }
+            // if (service.testCharacteristic(ColorTemperature)) {
+            //     service.getCharacteristic(ColorTemperature).updateValue(that.miredConversion(that.color.kelvin));
+            // }
 
-            if (service.testCharacteristic(ColorTemperature)) {
-                service.getCharacteristic(ColorTemperature).updateValue(this.miredConversion(this.color.kelvin));
-            }
+            // if (service.testCharacteristic(Characteristic.Hue)) {
+            //     service.getCharacteristic(Characteristic.Hue).updateValue(that.color.hue);
+            // }
 
-            if (service.testCharacteristic(Characteristic.Hue)) {
-                service.getCharacteristic(Characteristic.Hue).updateValue(this.color.hue);
-            }
-
-            if (service.testCharacteristic(Characteristic.Saturation)) {
-                service.getCharacteristic(Characteristic.Saturation).updateValue(this.color.saturation);
-            }
+            // if (service.testCharacteristic(Characteristic.Saturation)) {
+            //     service.getCharacteristic(Characteristic.Saturation).updateValue(that.color.saturation);
+            // }
         }
 
-        this.closeCallbacks(null, this.get(type));
+        callback(null, that.get(type));
+
+        // this.closeCallbacks(null, this.get(type));
     }.bind(this));
 }
 
@@ -824,6 +1158,13 @@ LifxAccessory.prototype.setColor = function(type, value, callback){
 
     this.color[type] = value;
 
+    this.log("%s - Stored value for %s: %d", this.accessory.context.name, type, this.color[type]);
+    
+    if (!this.bulbIsOnline) {
+        callback(null);
+        return;
+    }
+
     this.bulb.color(this.color.hue, this.color.saturation, this.color.brightness, this.color.kelvin, fadeDuration, function (err) {
         callback(null);
     });
@@ -862,11 +1203,17 @@ LifxAccessory.prototype.setSaturation = function(value, callback) {
 
 LifxAccessory.prototype.setPower = function(state, callback) {
     this.log("%s - Set power: %d", this.accessory.context.name, state);
+    
+    if (!this.bulbIsOnline) {
+        this.power = state;
+        callback(null);
+        return;
+    }
 
     this.bulb[state ? "on" : "off"](fadeDuration, function(err) {
-        if (!err) {
+        // if (!err) {
             this.power = state;
-        }
+        // }
 
         callback(null);
     }.bind(this));
@@ -985,7 +1332,18 @@ LifxAccessory.prototype.updateInfo = function() {
     }.bind(this));
 }
 
-LifxAccessory.prototype.updateReachability = function(bulb) {
+LifxAccessory.prototype.updateReachability = function(bulb, reachable) {
+
+    // this.accessory.updateReachability(reachable);
     this.bulb = bulb;
-    this.updateInfo();
+
+    if (!reachable) {
+        this.closeCallbacks('LIFX light went offline.');
+    }
+
+    if (reachable === true) {
+        this.updateInfo();
+    }
+    
+    this.bulbIsOnline = reachable;
 }

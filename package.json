@@ -26,6 +26,7 @@
         "smart bulb"
     ],
     "dependencies": {
-        "node-lifx": ">=0.8.0"
+        "node-lifx": ">=0.8.0",
+        "concat-stream": "^2.0.0"
     }
 }
